@@ -36,7 +36,8 @@
 ## 🖼️ 界面预览
 
 ```
-cde9a3e6-c02c-415d-84ef-487ed55accfc.png
+<img src="./cde9a3e6-c02c-415d-84ef-487ed55accfc.png" alt="PiPiClaw 多模型设置（OpenAI 协议兼容，支持多家 LLM）" width="49%" />
+
 ```
 
 ---
