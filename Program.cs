@@ -28,8 +28,9 @@ public class CreateCompanyReq
 public class NodeInfoTemplate
 {
     public string? name { get; set; }
-    public string? role { get; set; }
-    public string? url { get; set; }
+    public string? Role { get; set; }
+    public string? Url { get; set; }
+    public string? Description { get; set; }
 }
 public class ChatRequest
 {
@@ -44,13 +45,11 @@ public class ChatResponse
 }
 public class NodeInfo
 {
-    [JsonPropertyName("url")] // 显式指定，不管 JSON 里大写还是小写都能对上
-    public string? Url { get; set; }
-
-    [JsonPropertyName("role")]
-    public string? Role { get; set; }
+    [JsonPropertyName("Name")] public string? Name { get; set; }
+    [JsonPropertyName("Url")] public string? Url { get; set; }
+    [JsonPropertyName("Role")] public string? Role { get; set; }
+    [JsonPropertyName("Description")] public string? Description { get; set; }
 }
-
 // 2. 修改配置类
 public class AppConfig
 {
@@ -273,11 +272,23 @@ class Program
                 int successCount = 0;
                 var tasks = new List<Task>();
 
+                // 【新增】：找一个可用的节点，顺手把 "Team中控" 的记忆也彻底擦除
+                string hrAgentUrl = _config.PeerNodes.Values.FirstOrDefault(n => !string.IsNullOrEmpty(n.Url))?.Url ?? "http://127.0.0.1:5050";
+                tasks.Add(Task.Run(async () => {
+                    try
+                    {
+                        using var proxyReq = new HttpRequestMessage(HttpMethod.Post, hrAgentUrl.TrimEnd('/') + "/api/clear");
+                        proxyReq.Headers.Add("X-Username", Uri.EscapeDataString("Team中控"));
+                        await _httpClient.SendAsync(proxyReq);
+                    }
+                    catch { /* 忽略异常 */ }
+                }));
+
+                // 原有的遍历员工清理逻辑保持不变
                 foreach (var kvp in _config.PeerNodes)
                 {
                     if (string.IsNullOrEmpty(kvp.Value.Url)) continue;
 
-                    // 并发请求，不互相阻塞
                     tasks.Add(Task.Run(async () => {
                         try
                         {
@@ -297,6 +308,39 @@ class Program
             }
             else if (path == "/api/create_company" && req.HttpMethod == "POST")
             {
+                string callAgentUrl = _config.PeerNodes.Values.FirstOrDefault(n => !string.IsNullOrEmpty(n.Url))?.Url ?? "http://127.0.0.1:5050";
+
+                int successCount = 0;
+                var tasks = new List<Task>();
+
+                tasks.Add(Task.Run(async () => {
+                    try
+                    {
+                        using var proxyReq = new HttpRequestMessage(HttpMethod.Post, callAgentUrl.TrimEnd('/') + "/api/clear");
+                        proxyReq.Headers.Add("X-Username", Uri.EscapeDataString("Team中控"));
+                        await _httpClient.SendAsync(proxyReq);
+                    }
+                    catch { /* 忽略 */ }
+                }));
+
+                foreach (var kvp in _config.PeerNodes)
+                {
+                    if (string.IsNullOrEmpty(kvp.Value.Url)) continue;
+                    tasks.Add(Task.Run(async () => {
+                        try
+                        {
+                            using var proxyReq = new HttpRequestMessage(HttpMethod.Post, kvp.Value.Url.TrimEnd('/') + "/api/clear");
+                            proxyReq.Headers.Add("X-Username", Uri.EscapeDataString(kvp.Key));
+                            using var proxyRes = await _httpClient.SendAsync(proxyReq);
+                            if (proxyRes.IsSuccessStatusCode) Interlocked.Increment(ref successCount);
+                        }
+                        catch { /* 节点离线则忽略 */ }
+                    }));
+                }
+
+                await Task.WhenAll(tasks);
+
+                // 解析前端参数
                 using var reader = new StreamReader(req.InputStream);
                 string body = await reader.ReadToEndAsync();
                 var reqData = JsonSerializer.Deserialize(body, typeof(CreateCompanyReq), AppJsonContext.Default) as CreateCompanyReq;
@@ -307,23 +351,24 @@ class Program
                     return;
                 }
 
-                // 👉 1. 拿到你前端填的单个默认地址
                 string targetUrl = reqData.MasterNodeUrl.Trim();
 
-                // 随便找个能通的主节点发命令
-                string callAgentUrl = _config.PeerNodes.Values.FirstOrDefault(n => !string.IsNullOrEmpty(n.Url))?.Url ?? "http://127.0.0.1:5050";
 
                 // 👉 2. 把它塞给大模型，命令它用这个地址去改本地配置，最后再吐出带这个地址的 JSON
                 var prompt = $@"老板下达了开设新公司的指令，业务描述：【{reqData.Description}】。
 请你作为一个高级HR兼架构师，完成以下连串任务：
-1. 编排一个包含不多于 8 个核心员工的团队，生成他们的名字和岗位头衔。
-2. 注意：所有生成员工的 url 必须全部统一填为 ""{targetUrl}""。
+1. 编排一个包含不多于 21 个核心员工的团队，生成他们的名字和岗位头衔。
+2. 注意：所有生成员工的 Url 必须全部统一填为 ""{targetUrl}""。
 3. 调用你的本地工具，读取并修改你自己的 `appsettings.json`，把这些新员工信息补充到你的 `PeerNodes` 字典中。
 4. 彻底修改完你自己的配置后，请在最终回复中，**只输出**一个合法的 JSON 数组，供中控台同步使用。绝不要有任何多余的废话和 Markdown 标记。
 格式严格如下：
 [
-  {{ ""name"": ""员工姓名"", ""role"": ""岗位头衔"", ""url"": ""{targetUrl}"" }}
-]";
+  {{ ""name"": ""员工姓名"", ""Role"": ""岗位头衔"", ""Description"": ""负责的具体能力与工作任务说明"", ""Url"": ""{targetUrl}"" }}
+]
+注意：json字段不能省略必须严谨
+";
+
+
 
                 // 构造给皮皮虾的请求，使用符合 AOT 的 ChatRequest 强类型
                 var chatReq = new ChatRequest { message = prompt, modelIndex = 0 };
@@ -374,7 +419,7 @@ class Program
                             if (!string.IsNullOrEmpty(t.name))
                             {
                                 // 直接用大模型分配好的 url 和 role 同步进 Team
-                                _config.PeerNodes[t.name] = new NodeInfo { Url = t.url, Role = t.role };
+                                _config.PeerNodes[t.name] = new NodeInfo { Name = t.name, Url = t.Url, Role = t.Role, Description = t.Description };
                             }
                         }
                         // Team 把自己的 team_config.json 写盘
@@ -389,6 +434,13 @@ class Program
                     res.StatusCode = 500;
                     Console.WriteLine($"[指派招人异常] {ex.Message}");
                 }
+            }
+            else if (path == "/api/bankruptcy" && req.HttpMethod == "POST")
+            {
+                _config.PeerNodes.Clear(); 
+                File.WriteAllText(_configPath, JsonSerializer.Serialize(_config, typeof(AppConfig), AppJsonContext.Default), Encoding.UTF8);
+                res.ContentType = "application/json; charset=utf-8";
+                await res.OutputStream.WriteAsync(Encoding.UTF8.GetBytes("{\"status\":\"ok\"}"));
             }
             else
             {
@@ -794,6 +846,7 @@ class Program
         <div style="display: flex; justify-content: center; gap: 15px; margin-top: 15px;">
             <button onclick="clearAllMemory()" class="top-btn top-btn-clear">🧹 一键清空所有员工记忆</button>
             <button onclick="openCreateCompanyModal()" class="top-btn top-btn-create">🚀 一键开设公司</button>
+            <button onclick="bankruptcy()" class="top-btn" style="background: linear-gradient(135deg, #c0392b, #8e44ad); color:#fff;">💥 一键破产</button>
         </div>
     </div>
 
@@ -980,6 +1033,8 @@ class Program
                 style="padding:10px; border:1px solid #ddd; border-radius:8px; outline:none; font-weight:bold;">
             <input type="text" id="recruitRole" placeholder="岗位头衔 (如: 爬虫工程师)"
                 style="padding:10px; border:1px solid #ddd; border-radius:8px; outline:none;">
+            <input type="text" id="recruitDesc" placeholder="能力说明 (如: 负责网络数据抓取)"
+                style="padding:10px; border:1px solid #ddd; border-radius:8px; outline:none; font-size:12px;">
             <input type="text" id="recruitUrl" placeholder="节点URL (如: http://192.168.1.10:5050)"
                 style="padding:10px; border:1px solid #ddd; border-radius:8px; outline:none; font-size:12px;">
             <div style="display:flex; gap:10px; margin-top:10px;">
@@ -1089,7 +1144,8 @@ class Program
                     // 遍历保存的通讯录，依次填入工位
                     for (const [name, info] of Object.entries(cfg.PeerNodes)) {
                         if (index < desks.length) {
-                            renderEmployeeUI(desks[index], name, info.role || '资深员工');
+                            const role = info.Role || info.role || '资深员工';
+                            renderEmployeeUI(desks[index], name, role);
                             index++;
                         }
                     }
@@ -1161,17 +1217,17 @@ class Program
         function editEmployee() {
             closeModal('taskModal');
             isEditing = true;
-            originalEditName = currentTargetName; // 记录老名字，防止他改名
+            originalEditName = currentTargetName;
 
-            // 从后端拉取当前配置填入表单
             fetch('/api/config').then(r => r.json()).then(cfg => {
                 const nodeInfo = cfg.PeerNodes[currentTargetName];
                 if(nodeInfo) {
                     document.getElementById('recruitName').value = currentTargetName;
-                    document.getElementById('recruitRole').value = nodeInfo.role || '';
-                    document.getElementById('recruitUrl').value = nodeInfo.url || '';
+                    // 🌟 兼容大小写读取属性
+                    document.getElementById('recruitRole').value = nodeInfo.Role || nodeInfo.role || '';
+                    document.getElementById('recruitDesc').value = nodeInfo.Description || nodeInfo.description || '';
+                    document.getElementById('recruitUrl').value = nodeInfo.Url || nodeInfo.url || '';
 
-                    // 借用招人弹窗
                     document.getElementById('recruitModal').querySelector('h3').innerText = '📝 修改员工信息';
                     document.getElementById('recruitModal').style.display = 'flex';
                 }
@@ -1321,10 +1377,10 @@ class Program
         async function confirmRecruit() {
             const name = document.getElementById('recruitName').value.trim();
             const role = document.getElementById('recruitRole').value.trim() || '新晋员工';
+            const desc = document.getElementById('recruitDesc').value.trim() || '暂无说明';
             const url = document.getElementById('recruitUrl').value.trim();
 
             if (!name) return alert("员工姓名不能为空！");
-
             renderEmployeeUI(currentTargetDesk, name, role);
 
             try {
@@ -1332,12 +1388,12 @@ class Program
                 let cfg = await res.json();
                 if (!cfg.PeerNodes) cfg.PeerNodes = {};
 
-                // 如果是编辑模式，且改了名字，需要把旧名字的 Key 删掉
                 if (isEditing && originalEditName !== name && cfg.PeerNodes[originalEditName]) {
                     delete cfg.PeerNodes[originalEditName];
                 }
 
-                cfg.PeerNodes[name] = { url: url, role: role }; 
+                // 重点：大写属性同步给后端
+                cfg.PeerNodes[name] = { Url: url, Role: role, Description: desc }; 
 
                 await fetch('/api/config', {
                     method: 'POST',
@@ -1348,12 +1404,22 @@ class Program
                 console.error("同步失败:", e);
             }
 
-            // 状态还原
             isEditing = false;
             document.getElementById('recruitModal').querySelector('h3').innerText = '🤝 招募新员工';
             closeModal('recruitModal');
         }
-
+        async function bankruptcy() {
+            if (!confirm("老板，真的要【一键破产】吗？这会解散所有员工、清空公司，且无法恢复！")) return;
+            try {
+                const res = await fetch('/api/bankruptcy', { method: 'POST' });
+                if (res.ok) {
+                    alert("💥 公司已破产，所有员工已被遣散归乡！");
+                    location.reload(); 
+                }
+            } catch (e) {
+                alert("❌ 操作失败。");
+            }
+        }
         // 【新增逻辑】：确认开除员工流程
         async function fireEmployee() {
             if (!currentTargetDesk || !currentTargetName) return;
