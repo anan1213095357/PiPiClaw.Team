@@ -1355,10 +1355,15 @@ class Program
                     const history = await res.json();
                     let reportContent = "该员工当前没有任何工作记录。";
 
-                    if (history && history.length > 0) {
-                        // 找到最后一条 AI 的回复当做总结报告
-                        const lastMsg = history.slice().reverse().find(m => m.role === 'assistant' && m.content);
-                        if (lastMsg) reportContent = lastMsg.content;
+                        if (history && history.length > 0) {
+                            // 兼容 C# 的 PascalCase 和 JS 的 camelCase，且忽略 Assistant 大小写
+                            const lastMsg = history.slice().reverse().find(m => 
+                                (m.role?.toLowerCase() === 'assistant' || m.Role?.toLowerCase() === 'assistant') && 
+                                (m.content || m.Content)
+                        );
+                        if (lastMsg) {
+                            reportContent = lastMsg.content || lastMsg.Content;
+                        }
                     }
 
                     if (typeof marked !== 'undefined') {
