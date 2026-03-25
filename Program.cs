@@ -296,7 +296,7 @@ class Program
                 using var reader = new StreamReader(req.InputStream);
                 string body = await reader.ReadToEndAsync();
                 var reqData = JsonSerializer.Deserialize(body, typeof(CreateCompanyReq), AppJsonContext.Default) as CreateCompanyReq;
-                
+
                 if (reqData == null || string.IsNullOrEmpty(reqData.Description) || string.IsNullOrEmpty(reqData.MasterNodeUrl))
                 {
                     res.StatusCode = 400;
@@ -305,7 +305,7 @@ class Program
 
                 // 👉 1. 拿到你前端填的单个默认地址
                 string targetUrl = reqData.MasterNodeUrl.Trim();
-                
+
                 // 随便找个能通的主节点发命令
                 string callAgentUrl = _config.PeerNodes.Values.FirstOrDefault(n => !string.IsNullOrEmpty(n.Url))?.Url ?? "http://127.0.0.1:5050";
 
@@ -322,10 +322,10 @@ class Program
 ]";
 
                 // 构造给皮皮虾的请求，使用符合 AOT 的 ChatRequest 强类型
-                var chatReq = new ChatRequest { message = prompt, modelIndex = 0 }; 
+                var chatReq = new ChatRequest { message = prompt, modelIndex = 0 };
                 using var agentReq = new HttpRequestMessage(HttpMethod.Post, callAgentUrl.TrimEnd('/') + "/api/chat");
                 agentReq.Headers.Add("X-Username", Uri.EscapeDataString("Team中控"));
-                
+
                 // 严格使用 AOT 序列化
                 agentReq.Content = new StringContent(JsonSerializer.Serialize(chatReq, typeof(ChatRequest), AppJsonContext.Default), Encoding.UTF8, "application/json");
 
@@ -333,34 +333,36 @@ class Program
                 {
                     using var agentRes = await _httpClient.SendAsync(agentReq);
                     agentRes.EnsureSuccessStatusCode();
-                    
+
                     var agentResStr = await agentRes.Content.ReadAsStringAsync();
                     string finalJson = "[]";
-                    
+
                     var parts = agentResStr.Split(new[] { "|||END|||" }, StringSplitOptions.RemoveEmptyEntries);
                     foreach (var part in parts)
                     {
-                        try 
+                        try
                         {
                             var pushMsg = JsonSerializer.Deserialize(part, typeof(ChatResponse), AppJsonContext.Default) as ChatResponse;
                             if (pushMsg != null && pushMsg.type == "final" && !string.IsNullOrEmpty(pushMsg.content))
                             {
                                 finalJson = pushMsg.content;
                             }
-                        } catch { }
+                        }
+                        catch { }
                     }
 
                     // 暴力清洗大模型可能带上的 markdown 标记
                     finalJson = finalJson.Replace("```json", "").Replace("```", "").Trim();
                     int startIndex = finalJson.IndexOf('[');
                     int endIndex = finalJson.LastIndexOf(']');
-                    if (startIndex >= 0 && endIndex > startIndex) {
+                    if (startIndex >= 0 && endIndex > startIndex)
+                    {
                         finalJson = finalJson.Substring(startIndex, endIndex - startIndex + 1);
                     }
 
                     // 👉 3. Team 中控解析大模型吐回来的终极 JSON，同步配置
                     var templates = JsonSerializer.Deserialize(finalJson, typeof(List<NodeInfoTemplate>), AppJsonContext.Default) as List<NodeInfoTemplate>;
-                    
+
                     if (templates != null && templates.Count > 0)
                     {
                         foreach (var t in templates)
@@ -1294,8 +1296,10 @@ class Program
             }
         }
         async function confirmTask() {
-            const taskContent = document.getElementById('taskInput').value.trim();
+            let taskContent = document.getElementById('taskInput').value.trim();
             if (!taskContent) return alert("任务内容不能为空！");
+
+            taskContent += '注意：你是一个团队公司，这些任务需要你们公司团队人员协作配合完成。';
 
             closeModal('taskModal');
 
