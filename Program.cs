@@ -1045,7 +1045,7 @@ class Program
             </div>
         </div>
     </div>
-    <div id="createCompanyModal"<div id="createCompanyModal"
+<div id="createCompanyModal"
         style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:10000; align-items:center; justify-content:center; backdrop-filter:blur(3px);">
         <div style="background:#fff; padding:25px; border-radius:15px; width:340px; display:flex; flex-direction:column; gap:12px; box-shadow:0 10px 30px rgba(0,0,0,0.2);">
             <h3 style="margin:0 0 5px 0; text-align:center; color:#333;">🏢 一键开设公司</h3>
