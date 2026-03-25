@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -16,8 +16,21 @@ namespace PiPiClaw.Team;
 [JsonSerializable(typeof(string))]
 [JsonSerializable(typeof(ChatResponse))]
 [JsonSerializable(typeof(NodeInfo))]
+[JsonSerializable(typeof(CreateCompanyReq))]
+[JsonSerializable(typeof(NodeInfoTemplate))]
+[JsonSerializable(typeof(List<NodeInfoTemplate>))]
 internal partial class AppJsonContext : JsonSerializerContext { }
-
+public class CreateCompanyReq
+{
+    public string? Description { get; set; }
+    public string? MasterNodeUrl { get; set; }
+}
+public class NodeInfoTemplate
+{
+    public string? name { get; set; }
+    public string? role { get; set; }
+    public string? url { get; set; }
+}
 public class ChatRequest
 {
     public string? message { get; set; }
@@ -277,6 +290,99 @@ class Program
 
                 res.ContentType = "application/json; charset=utf-8";
                 await res.OutputStream.WriteAsync(Encoding.UTF8.GetBytes($"{{\"status\":\"ok\", \"cleared\":{successCount}}}"));
+            }
+            else if (path == "/api/create_company" && req.HttpMethod == "POST")
+            {
+                using var reader = new StreamReader(req.InputStream);
+                string body = await reader.ReadToEndAsync();
+                var reqData = JsonSerializer.Deserialize(body, typeof(CreateCompanyReq), AppJsonContext.Default) as CreateCompanyReq;
+                
+                if (reqData == null || string.IsNullOrEmpty(reqData.Description) || string.IsNullOrEmpty(reqData.MasterNodeUrl))
+                {
+                    res.StatusCode = 400;
+                    return;
+                }
+
+                // 👉 1. 拿到你前端填的单个默认地址
+                string targetUrl = reqData.MasterNodeUrl.Trim();
+                
+                // 随便找个能通的主节点发命令
+                string callAgentUrl = _config.PeerNodes.Values.FirstOrDefault(n => !string.IsNullOrEmpty(n.Url))?.Url ?? "http://127.0.0.1:5050";
+
+                // 👉 2. 把它塞给大模型，命令它用这个地址去改本地配置，最后再吐出带这个地址的 JSON
+                var prompt = $@"老板下达了开设新公司的指令，业务描述：【{reqData.Description}】。
+请你作为一个高级HR兼架构师，完成以下连串任务：
+1. 编排一个包含不多于 8 个核心员工的团队，生成他们的名字和岗位头衔。
+2. 注意：所有生成员工的 url 必须全部统一填为 ""{targetUrl}""。
+3. 调用你的本地工具，读取并修改你自己的 `appsettings.json`，把这些新员工信息补充到你的 `PeerNodes` 字典中。
+4. 彻底修改完你自己的配置后，请在最终回复中，**只输出**一个合法的 JSON 数组，供中控台同步使用。绝不要有任何多余的废话和 Markdown 标记。
+格式严格如下：
+[
+  {{ ""name"": ""员工姓名"", ""role"": ""岗位头衔"", ""url"": ""{targetUrl}"" }}
+]";
+
+                // 构造给皮皮虾的请求，使用符合 AOT 的 ChatRequest 强类型
+                var chatReq = new ChatRequest { message = prompt, modelIndex = 0 }; 
+                using var agentReq = new HttpRequestMessage(HttpMethod.Post, callAgentUrl.TrimEnd('/') + "/api/chat");
+                agentReq.Headers.Add("X-Username", Uri.EscapeDataString("Team中控"));
+                
+                // 严格使用 AOT 序列化
+                agentReq.Content = new StringContent(JsonSerializer.Serialize(chatReq, typeof(ChatRequest), AppJsonContext.Default), Encoding.UTF8, "application/json");
+
+                try
+                {
+                    using var agentRes = await _httpClient.SendAsync(agentReq);
+                    agentRes.EnsureSuccessStatusCode();
+                    
+                    var agentResStr = await agentRes.Content.ReadAsStringAsync();
+                    string finalJson = "[]";
+                    
+                    var parts = agentResStr.Split(new[] { "|||END|||" }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var part in parts)
+                    {
+                        try 
+                        {
+                            var pushMsg = JsonSerializer.Deserialize(part, typeof(ChatResponse), AppJsonContext.Default) as ChatResponse;
+                            if (pushMsg != null && pushMsg.type == "final" && !string.IsNullOrEmpty(pushMsg.content))
+                            {
+                                finalJson = pushMsg.content;
+                            }
+                        } catch { }
+                    }
+
+                    // 暴力清洗大模型可能带上的 markdown 标记
+                    finalJson = finalJson.Replace("```json", "").Replace("```", "").Trim();
+                    int startIndex = finalJson.IndexOf('[');
+                    int endIndex = finalJson.LastIndexOf(']');
+                    if (startIndex >= 0 && endIndex > startIndex) {
+                        finalJson = finalJson.Substring(startIndex, endIndex - startIndex + 1);
+                    }
+
+                    // 👉 3. Team 中控解析大模型吐回来的终极 JSON，同步配置
+                    var templates = JsonSerializer.Deserialize(finalJson, typeof(List<NodeInfoTemplate>), AppJsonContext.Default) as List<NodeInfoTemplate>;
+                    
+                    if (templates != null && templates.Count > 0)
+                    {
+                        foreach (var t in templates)
+                        {
+                            if (!string.IsNullOrEmpty(t.name))
+                            {
+                                // 直接用大模型分配好的 url 和 role 同步进 Team
+                                _config.PeerNodes[t.name] = new NodeInfo { Url = t.url, Role = t.role };
+                            }
+                        }
+                        // Team 把自己的 team_config.json 写盘
+                        File.WriteAllText(_configPath, JsonSerializer.Serialize(_config, typeof(AppConfig), AppJsonContext.Default), Encoding.UTF8);
+                    }
+
+                    res.ContentType = "application/json; charset=utf-8";
+                    await res.OutputStream.WriteAsync(Encoding.UTF8.GetBytes("{\"status\":\"ok\"}"));
+                }
+                catch (Exception ex)
+                {
+                    res.StatusCode = 500;
+                    Console.WriteLine($"[指派招人异常] {ex.Message}");
+                }
             }
             else
             {
@@ -600,7 +706,10 @@ class Program
     <div class="header">
         <h1>皮皮虾公司办公室</h1>
         <p>欢迎回来！这是您的团队。点击空位可以招募新🦐入职。</p>
-        <button onclick="clearAllMemory()" style="padding:8px 15px; background:#f39c12; color:#fff; border:none; border-radius:5px; cursor:pointer; font-weight:bold; margin-top:10px;">🧹 一键清空所有员工记忆</button>
+        <div style="display: flex; justify-content: center; gap: 10px; margin-top: 10px;">
+            <button onclick="clearAllMemory()" style="padding:8px 15px; background:#f39c12; color:#fff; border:none; border-radius:5px; cursor:pointer; font-weight:bold;">🧹 一键清空所有员工记忆</button>
+            <button onclick="openCreateCompanyModal()" style="padding:8px 15px; background:#2980b9; color:#fff; border:none; border-radius:5px; cursor:pointer; font-weight:bold;">🏢 一键开设公司</button>
+        </div>
     </div>
 
     <div class="desk-grid">
@@ -756,6 +865,25 @@ class Program
             </div>
         </div>
     </div>
+    <div id="createCompanyModal"<div id="createCompanyModal"
+        style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:10000; align-items:center; justify-content:center; backdrop-filter:blur(3px);">
+        <div style="background:#fff; padding:25px; border-radius:15px; width:340px; display:flex; flex-direction:column; gap:12px; box-shadow:0 10px 30px rgba(0,0,0,0.2);">
+            <h3 style="margin:0 0 5px 0; text-align:center; color:#333;">🏢 一键开设公司</h3>
+            
+            <textarea id="companyDesc" placeholder="请输入公司愿景或业务描述..."
+                style="padding:10px; border:1px solid #ddd; border-radius:8px; outline:none; height:80px; resize:none; font-family:inherit;"></textarea>
+
+            <input type="text" id="masterNodeUrl" placeholder="要分配的统一地址 (默认: http://127.0.0.1:5050)"
+                style="padding:10px; border:1px solid #ddd; border-radius:8px; outline:none; font-size:13px; font-family:monospace;">
+            
+            <div style="display:flex; gap:10px; margin-top:10px;">
+                <button id="btnConfirmCreate" onclick="confirmCreateCompany()"
+                    style="flex:1; padding:10px; background:#2980b9; color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:bold;">开始入职</button>
+                <button onclick="closeModal('createCompanyModal')"
+                    style="flex:1; padding:10px; background:#eee; color:#666; border:none; border-radius:8px; cursor:pointer;">取消</button>
+            </div>
+        </div>
+    </div>
     <div id="reportModal" onclick="if(event.target===this) closeModal('reportModal')">
         <div class="report-content">
             <div class="report-header">
@@ -793,7 +921,7 @@ class Program
     <script>
         let currentTargetDesk = null;
         let currentTargetName = '';
-const deskReports = {};
+        const deskReports = {};
         // 统一关闭弹窗
         function closeModal(id) {
             document.getElementById(id).style.display = 'none';
@@ -862,6 +990,48 @@ const deskReports = {};
 
         let isEditing = false;
         let originalEditName = "";
+
+        function openCreateCompanyModal() {
+            document.getElementById('companyDesc').value = '';
+            document.getElementById('masterNodeUrl').value = localStorage.getItem('temp_master_url') || 'http://127.0.0.1:5050';
+            document.getElementById('createCompanyModal').style.display = 'flex';
+        }
+
+        async function confirmCreateCompany() {
+            const desc = document.getElementById('companyDesc').value.trim();
+            const masterUrl = document.getElementById('masterNodeUrl').value.trim() || 'http://127.0.0.1:5050';
+
+            if (!desc) return alert("请先描述业务！");
+            
+            localStorage.setItem('temp_master_url', masterUrl);
+
+            const btn = document.getElementById('btnConfirmCreate');
+            const originalText = btn.innerText;
+            btn.innerText = "安排入职中...";
+            btn.disabled = true;
+
+            try {
+                const res = await fetch('/api/create_company', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    // 把业务描述和这个唯一的地址传给后端
+                    body: JSON.stringify({ description: desc, masterNodeUrl: masterUrl })
+                });
+
+                if (res.ok) {
+                    alert("🎉 招募完毕，员工已入职！");
+                    location.reload(); 
+                } else {
+                    alert("❌ 失败！请检查节点是否存活。");
+                }
+            } catch (e) {
+                console.error(e);
+                alert("❌ 网络请求异常。");
+            } finally {
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }
+        }
 
         function editEmployee() {
             closeModal('taskModal');
