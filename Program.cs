@@ -1598,6 +1598,29 @@ class Program
 
 
 
+        // 新增：根据姓名生成固定图片的哈希算法
+        function getAvatarByName(name) {
+            if (!name) return 'img_shrimp_working.png';
+
+            // 候选图片池 (总共 9 张)
+            const images = [
+                '1.png', '2.png', '3.png', '4.png', 
+                '5.png', '6.png', '7.png', '8.png', 
+                'img_shrimp_working.png'
+            ];
+
+            // 计算字符串的 Hash 值
+            let hash = 0;
+            for (let i = 0; i < name.length; i++) {
+                hash = name.charCodeAt(i) + ((hash << 5) - hash);
+            }
+
+            // 取绝对值并对图片数组长度取余，算出具体的索引
+            const index = Math.abs(hash) % images.length;
+            return images[index];
+        }
+
+        // 替换：修改渲染工位的方法，调用我们写好的算法
         function renderEmployeeUI(deskElement, name, role) {
             deskElement.className = 'company-card at-work';
 
@@ -1605,12 +1628,16 @@ class Program
             const deskId = 'desk_' + Math.random().toString(36).substr(2, 9);
             deskElement.dataset.deskId = deskId;
 
+            // 根据名字获取对应的图片名称
+            const avatarImg = getAvatarByName(name);
+
             // 【核心修复1】：把 report-badge 移到 desk-img-container 内部
             // 【核心修复2】：为 role 添加 role-scroll-wrapper 容器
+            // 【新增修改】：将写死的 img_shrimp_working.png 替换为动态获取的 avatarImg
             deskElement.innerHTML = `
                 <div class="chat-bubble" onclick="openReportFromBubble(event, this)">摸鱼中...</div>
                 <div class="desk-img-container">
-                    <img src="img_shrimp_working.png" alt="皮皮虾办公" class="shrimp-desk-img">
+                    <img src="${avatarImg}" alt="皮皮虾办公" class="shrimp-desk-img">
                     <img src="img_empty_desk.png" alt="空桌子" class="empty-desk-img">
                     <img src="penzai2.png" class="desk-penzai">
                     <img src="penzai1.png" class="desk-penzai-2">
