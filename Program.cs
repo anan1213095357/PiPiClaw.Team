@@ -23,6 +23,7 @@ namespace PiPiClaw.Team;
 [JsonSerializable(typeof(Dictionary<string, JsonElement>))]
 [JsonSerializable(typeof(JsonElement))]
 [JsonSerializable(typeof(CompanySetupResult))]
+[JsonSerializable(typeof(List<JsonElement>))]
 internal partial class AppJsonContext : JsonSerializerContext { }
 public class CreateCompanyReq
 {
@@ -78,6 +79,9 @@ class Program
     private static AppConfig _config = new AppConfig();
     private static string _configPath = "team_config.json";
     private static readonly HttpClient _httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
+
+    const string BossMarketUrl = "http://127.0.0.1:8888";
+
     static async Task Main(string[] args)
     {
         string url = "http://+:4050/";
@@ -335,7 +339,8 @@ class Program
 
                 // 【新增】：找一个可用的节点，顺手把 "Team中控" 的记忆也彻底擦除
                 string hrAgentUrl = _config.PeerNodes.Values.FirstOrDefault(n => !string.IsNullOrEmpty(n.Url))?.Url ?? "http://127.0.0.1:5050";
-                tasks.Add(Task.Run(async () => {
+                tasks.Add(Task.Run(async () =>
+                {
                     try
                     {
                         using var proxyReq = new HttpRequestMessage(HttpMethod.Post, hrAgentUrl.TrimEnd('/') + "/api/clear");
@@ -350,7 +355,8 @@ class Program
                 {
                     if (string.IsNullOrEmpty(kvp.Value.Url)) continue;
 
-                    tasks.Add(Task.Run(async () => {
+                    tasks.Add(Task.Run(async () =>
+                    {
                         try
                         {
                             using var proxyReq = new HttpRequestMessage(HttpMethod.Post, kvp.Value.Url.TrimEnd('/') + "/api/clear");
@@ -374,7 +380,8 @@ class Program
                 int successCount = 0;
                 var tasks = new List<Task>();
 
-                tasks.Add(Task.Run(async () => {
+                tasks.Add(Task.Run(async () =>
+                {
                     try
                     {
                         using var proxyReq = new HttpRequestMessage(HttpMethod.Post, callAgentUrl.TrimEnd('/') + "/api/clear");
@@ -387,7 +394,8 @@ class Program
                 foreach (var kvp in _config.PeerNodes)
                 {
                     if (string.IsNullOrEmpty(kvp.Value.Url)) continue;
-                    tasks.Add(Task.Run(async () => {
+                    tasks.Add(Task.Run(async () =>
+                    {
                         try
                         {
                             using var proxyReq = new HttpRequestMessage(HttpMethod.Post, kvp.Value.Url.TrimEnd('/') + "/api/clear");
@@ -531,6 +539,103 @@ class Program
                 res.ContentType = "application/json; charset=utf-8";
                 await res.OutputStream.WriteAsync(Encoding.UTF8.GetBytes("{\"status\":\"ok\"}"));
             }
+
+
+            // [Team后端] 获取轻量级人才列表
+            else if (path == "/api/boss/list" && req.HttpMethod == "GET")
+            {
+                try
+                {
+                    using var proxyReq = new HttpRequestMessage(HttpMethod.Get, BossMarketUrl + "/api/list");
+                    using var proxyRes = await _httpClient.SendAsync(proxyReq);
+                    proxyRes.EnsureSuccessStatusCode();
+                    var responseBytes = await proxyRes.Content.ReadAsByteArrayAsync();
+                    res.ContentType = "application/json; charset=utf-8";
+                    res.ContentLength64 = responseBytes.Length;
+                    await res.OutputStream.WriteAsync(responseBytes);
+                }
+                catch { res.StatusCode = 500; }
+            }
+
+            // [Team后端] 上传员工到 BOSS (二进制流无缝透传)
+            else if (path == "/api/boss/upload" && req.HttpMethod == "POST")
+            {
+                string username = Uri.UnescapeDataString(req.Headers["X-Username"] ?? "");
+                if (_config.PeerNodes.TryGetValue(username, out var nodeInfo) && !string.IsNullOrEmpty(nodeInfo.Url))
+                {
+                    try
+                    {
+                        // 1. 向底层节点请求 ZIP 流和 Profile 头
+                        var exportUrl = nodeInfo.Url.TrimEnd('/') + "/api/export";
+                        using var exportReq = new HttpRequestMessage(HttpMethod.Get, exportUrl);
+                        exportReq.Headers.Add("X-Username", Uri.EscapeDataString(username));
+
+                        // 使用 ResponseHeadersRead 确保流不被缓冲进内存
+                        using var exportRes = await _httpClient.SendAsync(exportReq, HttpCompletionOption.ResponseHeadersRead);
+                        exportRes.EnsureSuccessStatusCode();
+
+                        // 2. 拿到流后，直接怼给 BOSS 服务器
+                        var uploadReq = new HttpRequestMessage(HttpMethod.Post, BossMarketUrl + "/api/upload");
+                        // 将节点传给我们的 Profile 头原封不动挂上去
+                        uploadReq.Headers.Add("X-Agent-Profile", exportRes.Headers.GetValues("X-Agent-Profile").First());
+                        uploadReq.Content = new StreamContent(await exportRes.Content.ReadAsStreamAsync());
+                        uploadReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/zip");
+
+                        using var uploadRes = await _httpClient.SendAsync(uploadReq);
+                        uploadRes.EnsureSuccessStatusCode();
+
+                        res.StatusCode = 200;
+                    }
+                    catch (Exception ex) { Console.WriteLine(ex.Message); res.StatusCode = 500; }
+                }
+            }
+
+            // [Team后端] 从 BOSS 招募员工分发到底层节点 (二进制流无缝透传)
+            else if (path == "/api/boss/hire" && req.HttpMethod == "POST")
+            {
+                using var reader = new StreamReader(req.InputStream);
+                var bodyJson = JsonDocument.Parse(await reader.ReadToEndAsync()).RootElement;
+                string targetName = bodyJson.GetProperty("name").GetString() ?? "";
+                string targetNodeUrl = bodyJson.GetProperty("nodeUrl").GetString() ?? "";
+
+                try
+                {
+                    // 1. 去 BOSS 服务器下载完整的 ZIP 流
+                    var dlReq = new HttpRequestMessage(HttpMethod.Get, $"{BossMarketUrl}/api/download?name={Uri.EscapeDataString(targetName)}");
+                    using var dlRes = await _httpClient.SendAsync(dlReq, HttpCompletionOption.ResponseHeadersRead);
+                    dlRes.EnsureSuccessStatusCode();
+
+                    // 2. 把刚拉下来的流，直接转手推给目标底层节点的 /api/import
+                    var importReq = new HttpRequestMessage(HttpMethod.Post, targetNodeUrl.TrimEnd('/') + "/api/import");
+                    importReq.Headers.Add("X-Username", Uri.EscapeDataString(targetName));
+                    importReq.Content = new StreamContent(await dlRes.Content.ReadAsStreamAsync());
+                    importReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/zip");
+
+                    using var importRes = await _httpClient.SendAsync(importReq);
+                    importRes.EnsureSuccessStatusCode();
+
+                    // 3. 在中控团队注册该员工 (获取一下简历补充进配置)
+                    var listRes = await _httpClient.GetStringAsync(BossMarketUrl + "/api/list");
+                    var allAgents = JsonSerializer.Deserialize(listRes, AppJsonContext.Default.ListJsonElement);
+                    var agent = allAgents.FirstOrDefault(a => a.GetProperty("Name").GetString() == targetName);
+
+                    _config.PeerNodes[targetName] = new NodeInfo
+                    {
+                        Name = targetName,
+                        Url = targetNodeUrl,
+                        Role = agent.GetProperty("Role").GetString() ?? "新员工",
+                        Description = agent.GetProperty("Description").GetString() ?? "",
+                        Resume = agent.GetProperty("Resume").GetString() ?? "",
+                        ModelIndex = agent.GetProperty("ModelIndex").GetInt32()
+                    };
+                    File.WriteAllText(_configPath, JsonSerializer.Serialize(_config, AppJsonContext.Default.AppConfig), Encoding.UTF8);
+                    await SyncPeerNodesToMasterAsync();
+
+                    res.StatusCode = 200;
+                }
+                catch { res.StatusCode = 500; }
+            }
+
             else
             {
                 res.StatusCode = 404;
@@ -1072,6 +1177,110 @@ class Program
     0%, 100% { opacity: 1; }
     50% { opacity: 0.6; }
 }
+
+
+/* --- 💼 BOSS 直聘：高级人才市场 UI --- */
+#bossTalentList::-webkit-scrollbar {
+    width: 6px;
+}
+#bossTalentList::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 3px;
+}
+#bossTalentList::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.talent-card {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    padding: 15px;
+    border-radius: 12px;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    transition: all 0.3s ease;
+    margin-bottom: 10px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.02);
+}
+.talent-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 20px rgba(0,0,0,0.08);
+    border-color: #cbd5e1;
+}
+.talent-avatar {
+    flex-shrink: 0;
+    width: 55px;
+    height: 55px;
+    border-radius: 50%;
+    border: 2px solid #f8fafc;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.06);
+    overflow: hidden;
+    background: #f1f5f9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.talent-avatar img {
+    width: 80%; /* 调整皮皮虾图片的显示比例 */
+    height: auto;
+}
+.talent-info {
+    flex-grow: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.talent-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.talent-name {
+    font-size: 1.1em;
+    font-weight: bold;
+    color: #1e293b;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.talent-role {
+    font-size: 0.75em;
+    background: linear-gradient(135deg, #3b82f6, #2563eb);
+    color: white;
+    padding: 3px 8px;
+    border-radius: 12px;
+    white-space: nowrap;
+    box-shadow: 0 2px 5px rgba(59, 130, 246, 0.2);
+}
+.talent-desc {
+    font-size: 0.85em;
+    color: #64748b;
+    line-height: 1.5;
+    display: -webkit-box;
+    -webkit-line-clamp: 2; /* 最多显示2行，超出省略号 */
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+.talent-action {
+    flex-shrink: 0;
+}
+.btn-hire {
+    padding: 8px 16px;
+    background: linear-gradient(135deg, #10b981, #059669);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-weight: bold;
+    box-shadow: 0 4px 10px rgba(16, 185, 129, 0.2);
+    transition: all 0.2s;
+}
+.btn-hire:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 15px rgba(16, 185, 129, 0.35);
+}
     </style>
 </head>
 
@@ -1084,6 +1293,7 @@ class Program
             <div style="display: flex; gap: 10px; margin-top: 15px; flex-wrap: wrap;">
                 <button onclick="clearAllMemory()" class="top-btn top-btn-clear">🧹 一键清空记忆</button>
                 <button onclick="openCreateCompanyModal()" class="top-btn top-btn-create">🚀 一键开设公司</button>
+                <button onclick="openBossMarket()" class="top-btn" style="background: linear-gradient(135deg, #27ae60, #2ecc71); color:#fff; box-shadow: 0 4px 10px rgba(39,174,96,0.3);">💼 BOSS 直聘</button>
                 <button onclick="bankruptcy()" class="top-btn" style="background: linear-gradient(135deg, #c0392b, #8e44ad); color:#fff;">💥 一键破产</button>
             </div>
         </div>
@@ -1350,11 +1560,26 @@ class Program
                         style="flex:1; padding:10px; background:#2ecc71; color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:bold;">修改信息</button>
                 <button onclick="fireEmployee()"
                     style="flex:1; padding:10px; background:#e74c3c; color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:bold;">开除员工</button>
+                <button onclick="uploadToBoss()" style="flex:1.5; padding:10px; background:linear-gradient(135deg, #8e44ad, #9b59b6); color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:bold; box-shadow: 0 4px 10px rgba(142,68,173,0.3);">⬆️ 上传至直聘</button>
                 <button onclick="closeModal('taskModal')"
                     style="flex:1; padding:10px; background:#eee; color:#666; border:none; border-radius:8px; cursor:pointer;">取消关闭</button>
             </div>
         </div>
     </div>
+
+<div id="bossModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:10000; align-items:center; justify-content:center; backdrop-filter:blur(5px);">
+    <div style="background:#f8fafc; padding:25px; border-radius:15px; width:550px; max-height:80vh; display:flex; flex-direction:column; box-shadow:0 10px 30px rgba(0,0,0,0.2);">
+        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom: 1px solid #e2e8f0; padding-bottom: 15px; margin-bottom: 10px;">
+            <h3 style="margin:0; color:#059669; display: flex; align-items: center; gap: 8px;">💼 人才市场</h3>
+            <button onclick="closeModal('bossModal')" style="background:none; border:none; font-size:1.4em; cursor:pointer; color:#94a3b8; transition: color 0.2s;" onmouseover="this.style.color='#ef4444'" onmouseout="this.style.color='#94a3b8'">✖</button>
+        </div>
+        <div id="bossTalentList" style="flex:1; overflow-y:auto; display:flex; flex-direction:column; padding-right:8px;">
+        </div>
+    </div>
+</div>
+
+
+
 <div id="loadingOverlay" class="hr-loading-container">
     <div class="hr-spinner"></div>
     <div class="hr-loading-text">HR 正在拼命招人中...</div>
@@ -1471,10 +1696,130 @@ class Program
             }
         });
 
+function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", "&#39;");
+}
 
 
 
-        // 👇 新增：去目标节点拉取它的 appsettings.json 里的 Models 列表
+async function openBossMarket() {
+    document.getElementById('bossModal').style.display = 'flex';
+    const listContainer = document.getElementById('bossTalentList');
+
+    // 渲染高逼格的加载动画
+    listContainer.innerHTML = `
+        <div style="text-align:center; color:#94a3b8; padding: 40px;">
+            <div class="hr-spinner" style="margin: 0 auto 15px; width: 40px; height: 40px;"></div>
+            正在连接云端人才库...
+        </div>`;
+
+    try {
+        const res = await fetch('/api/boss/list');
+        if (!res.ok) throw new Error('网络错误');
+        const list = await res.json();
+
+        if (!list || list.length === 0) {
+            listContainer.innerHTML = '<div style="text-align:center; color:#64748b; padding: 40px; background: #fff; border-radius: 10px; border: 1px dashed #cbd5e1;">当前市场没有正在求职的员工数据包。</div>';
+            return;
+        }
+
+        let html = '';
+        list.forEach(t => {
+            // 复用你已经写好的头像哈希算法
+            const avatar = getAvatarByName(t.Name);
+
+            html += `
+            <div class="talent-card">
+                <div class="talent-avatar">
+                    <img src="${avatar}" onerror="this.src='img_shrimp_working.png'">
+                </div>
+
+                <div class="talent-info">
+                    <div class="talent-header">
+                        <span class="talent-name" title="${escapeHtml(t.Name)}">${escapeHtml(t.Name)}</span>
+                        <span class="talent-role">${escapeHtml(t.Role)}</span>
+                    </div>
+                    <div class="talent-desc" title="${escapeHtml(t.Description)}">${escapeHtml(t.Description)}</div>
+                </div>
+
+                <div class="talent-action">
+                    <button class="btn-hire" onclick="hireFromBoss('${escapeHtml(t.Name)}')">📥 录用</button>
+                </div>
+            </div>`;
+        });
+        listContainer.innerHTML = html;
+    } catch (e) {
+        listContainer.innerHTML = '<div style="color:#ef4444; text-align:center; padding: 40px; background: #fff; border-radius: 10px;">❌ 无法连接到BOSS服务器，请检查后端路由。</div>';
+    }
+}
+
+// 2. 从直聘大厅录用员工
+async function hireFromBoss(agentName) {
+    const nodeUrl = prompt(`请分配物理工位：\n要把【${agentName}】的数据包解压部署到哪个底层节点URL？`, "http://127.0.0.1:5050");
+    if (!nodeUrl) return;
+
+    if (!confirm(`确定录用【${agentName}】？\n系统将拉取其完整的 ZIP 数据（含记忆、技能库、历史）并部署至 ${nodeUrl}。`)) return;
+
+    document.getElementById('loadingOverlay').style.display = 'flex';
+    document.querySelector('.hr-loading-text').innerText = 'HR正在疯狂下载数据包并办理入职...';
+
+    try {
+        const res = await fetch('/api/boss/hire', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: agentName, nodeUrl: nodeUrl })
+        });
+        if (res.ok) {
+            alert(`🎉 搞定！【${agentName}】已空降工位，技能记忆全部恢复。`);
+            location.reload();
+        } else {
+            alert("❌ 录用失败，请检查目标节点是否存活或跨域配置。");
+        }
+    } catch (e) {
+        alert("网络异常: " + e.message);
+    } finally {
+        document.getElementById('loadingOverlay').style.display = 'none';
+        document.querySelector('.hr-loading-text').innerText = 'HR 正在拼命招人中...';
+    }
+}
+
+// 3. 将本地员工打包上传到云端
+async function uploadToBoss() {
+    if (!currentTargetName) return;
+    if (!confirm(`确定要把【${currentTargetName}】打包上传吗？\n系统将自动生成 ZIP (简历、技能扩展、记忆)，并推送到云端交易大厅。`)) return;
+
+    closeModal('taskModal');
+    document.getElementById('loadingOverlay').style.display = 'flex';
+    document.querySelector('.hr-loading-text').innerText = '正在将员工打包并上传至云端...';
+
+    try {
+        const res = await fetch('/api/boss/upload', {
+            method: 'POST',
+            headers: { 'X-Username': encodeURIComponent(currentTargetName) }
+        });
+        if (res.ok) {
+            alert(`✅ 【${currentTargetName}】的数据包已成功挂至人才市场！`);
+        } else {
+            alert("❌ 上传失败，请检查后端是否正常连通了 BOSS 服务器。");
+        }
+    } catch (e) {
+        alert("网络异常: " + e.message);
+    } finally {
+        document.getElementById('loadingOverlay').style.display = 'none';
+        document.querySelector('.hr-loading-text').innerText = 'HR 正在拼命招人中...';
+    }
+}
+
+
+
+
+
         async function fetchNodeModels(targetIndex = null) {
             const url = document.getElementById('recruitUrl').value.trim();
             const select = document.getElementById('recruitModelIndex');
