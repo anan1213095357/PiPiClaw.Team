@@ -165,7 +165,7 @@ class Program
             // 3. 写回底层节点
             var postReq = new HttpRequestMessage(HttpMethod.Post, targetUrl.TrimEnd('/') + "/api/config");
             postReq.Content = new StringContent(JsonSerializer.Serialize(masterCfgDict, AppJsonContext.Default.DictionaryStringJsonElement), Encoding.UTF8, "application/json");
-            await _httpClient.SendAsync(postReq);
+            using var postRes = await _httpClient.SendAsync(postReq);
 
             Console.WriteLine($"[强绑定] 已将最新通讯录 ({_config.PeerNodes.Count} 人) 实时同步到底层节点 {targetUrl}！");
         }
@@ -378,7 +378,7 @@ class Program
                     {
                         using var proxyReq = new HttpRequestMessage(HttpMethod.Post, hrAgentUrl.TrimEnd('/') + "/api/clear");
                         proxyReq.Headers.Add("X-Username", Uri.EscapeDataString("Team中控"));
-                        await _httpClient.SendAsync(proxyReq);
+                        using var proxyRes = await _httpClient.SendAsync(proxyReq);
                     }
                     catch { /* 忽略异常 */ }
                 }));
@@ -419,7 +419,7 @@ class Program
                     {
                         using var proxyReq = new HttpRequestMessage(HttpMethod.Post, callAgentUrl.TrimEnd('/') + "/api/clear");
                         proxyReq.Headers.Add("X-Username", Uri.EscapeDataString("Team中控"));
-                        await _httpClient.SendAsync(proxyReq);
+                        using var proxyRes = await _httpClient.SendAsync(proxyReq);
                     }
                     catch { /* 忽略 */ }
                 }));
@@ -1457,19 +1457,48 @@ class Program
 }
 
 /* --- 替换后的项目列表样式 --- */
-.project-list-container { display: flex; flex-direction: column; gap: 15px; flex: 1; overflow-y: auto; margin-top: 15px; padding-right: 5px; }
+.project-list-container { 
+    min-height: 0; 
+    overflow-y: auto; 
+    margin-top: 15px; 
+    padding-right: 5px; 
+}
 .project-list-container::-webkit-scrollbar { width: 6px; }
 .project-list-container::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
-.project-group { background: #fff; border-radius: 10px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.02); transition: all 0.2s ease; }
+.project-group { margin-bottom: 10px;background: #fff; border-radius: 10px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.02); transition: all 0.2s ease; }
 .project-group:hover { box-shadow: 0 4px 15px rgba(0,0,0,0.06); }
 .project-header { display: flex; justify-content: space-between; align-items: center; padding: 15px 20px; background: #f8fafc; cursor: pointer; transition: background 0.2s; border-bottom: 1px solid transparent; user-select: none; }
 .project-header:hover { background: #f1f5f9; }
 .project-header.expanded { border-bottom-color: #e2e8f0; }
-.project-title { font-weight: bold; font-size: 1.05em; color: #1e293b; display: flex; align-items: center; gap: 8px; min-width: 150px; }
-.project-progress-container { flex: 1; margin: 0 20px; max-width: 300px; display: flex; flex-direction: column; gap: 4px; }
+.project-title { 
+    font-weight: bold; 
+    font-size: 1.05em; 
+    color: #1e293b; 
+    display: flex; 
+    align-items: center; 
+    gap: 8px; 
+    flex: 1; /* 核心修改：自动霸占所有左侧剩余空间 */
+    min-width: 0; /* 防止超长文本撑破布局 */
+    overflow: hidden; 
+    white-space: nowrap; 
+    text-overflow: ellipsis; 
+}
+.project-progress-container { 
+    flex: 0 0 180px;
+    margin: 0 20px; 
+    display: flex; 
+    flex-direction: column; 
+    gap: 4px; 
+}
 .progress-bar-bg { height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden; width: 100%; }
 .progress-bar-fill { height: 100%; background: linear-gradient(90deg, #3b82f6, #10b981); transition: width 0.4s ease; }
-.project-meta { font-size: 0.85em; color: #64748b; font-weight: bold; min-width: 80px; text-align: right; }
+.project-meta { 
+    font-size: 0.85em; 
+    color: #64748b; 
+    font-weight: bold; 
+    flex: 0 0 60px; 
+    text-align: right; 
+}
 .task-list { padding: 5px 20px 15px 20px; background: #fff; }
 .task-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px dashed #f1f5f9; transition: background 0.2s; }
 .task-row:last-child { border-bottom: none; }
