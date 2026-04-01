@@ -54,6 +54,9 @@ public class ChatRequest
     public int modelIndex { get; set; }
 
     public string? sop { get; set; }
+
+    public string? caller { get; set; }
+    public string? taskId { get; set; }
 }
 
 public class ChatResponse
@@ -107,7 +110,7 @@ class Program
     private static readonly HttpClient _httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
 
 #if DEBUG
-    const string BossMarketUrl = "http://127.0.0.1:8888";
+    const string BossMarketUrl = "http://ddns.work:8888";
 #else
     const string BossMarketUrl = "http://ddns.work:8888";
 #endif
@@ -253,7 +256,7 @@ class Program
             // 5. 聊天流式接口 POST /api/chat (已联动真正的节点端)
             else if (path == "/api/chat" && req.HttpMethod == "POST")
             {
-
+                string targetUrl = string.IsNullOrEmpty(_config.MasterNodeUrl) ? "http://127.0.0.1:5050" : _config.MasterNodeUrl;
                 string username = req.Headers["X-Username"] ?? "未知员工";
                 username = Uri.UnescapeDataString(username);
 
@@ -262,15 +265,6 @@ class Program
 
                 using var writer = new StreamWriter(res.OutputStream, new UTF8Encoding(false)) { AutoFlush = true };
 
-                // 1. 查找通讯录中该员工对应的真实节点 URL
-                if (!_config.PeerNodes.TryGetValue(username, out var nodeInfo) || string.IsNullOrEmpty(nodeInfo.Url))
-                {
-                    var errMsg = JsonSerializer.Serialize(new ChatResponse { type = "final", content = $"[调度失败] 未找到【{username}】的节点地址。" }, AppJsonContext.Default.ChatResponse);
-                    await writer.WriteAsync(errMsg + "|||END|||");
-                    return;
-                }
-                string targetUrl = nodeInfo.Url;
-                // 2. 读取前端发来的请求体 (包含 message 和 modelIndex)
                 using var reader = new StreamReader(req.InputStream);
                 string body = await reader.ReadToEndAsync();
 
@@ -343,18 +337,26 @@ class Program
             else if ((path == "/api/clear" || path == "/api/cancel") && req.HttpMethod == "POST")
             {
                 string username = Uri.UnescapeDataString(req.Headers["X-Username"] ?? "");
-                if (!_config.PeerNodes.TryGetValue(username, out var nodeInfo) || string.IsNullOrEmpty(nodeInfo.Url))
+                string targetUrl = "";
+                if (username.ToLower() == "ceo")
+                {
+                    targetUrl = _config.PeerNodes.Values.FirstOrDefault(n => !string.IsNullOrEmpty(n.Url))?.Url ?? (_config.MasterNodeUrl ?? "http://127.0.0.1:5050");
+                }
+                else if (_config.PeerNodes.TryGetValue(username, out var nodeInfo) && !string.IsNullOrEmpty(nodeInfo.Url))
+                {
+                    targetUrl = nodeInfo.Url;
+                }
+                if (string.IsNullOrEmpty(targetUrl))
                 {
                     res.StatusCode = 404;
                     return;
                 }
                 try
                 {
-                    using var proxyReq = new HttpRequestMessage(HttpMethod.Post, nodeInfo.Url.TrimEnd('/') + path);
+                    using var proxyReq = new HttpRequestMessage(HttpMethod.Post, targetUrl.TrimEnd('/') + path);
                     proxyReq.Headers.Add("X-Username", Uri.EscapeDataString(username));
                     using var proxyRes = await _httpClient.SendAsync(proxyReq);
                     proxyRes.EnsureSuccessStatusCode();
-
                     res.ContentType = "application/json; charset=utf-8";
                     string statusResp = path == "/api/cancel" ? "{\"status\":\"cancelled\"}" : "{\"status\":\"cleared\"}";
                     await res.OutputStream.WriteAsync(Encoding.UTF8.GetBytes(statusResp));
@@ -370,14 +372,14 @@ class Program
                 int successCount = 0;
                 var tasks = new List<Task>();
 
-                // 【新增】：找一个可用的节点，顺手把 "Team中控" 的记忆也彻底擦除
+                // 【新增】：找一个可用的节点，顺手把 "ceo" 的记忆也彻底擦除
                 string hrAgentUrl = _config.PeerNodes.Values.FirstOrDefault(n => !string.IsNullOrEmpty(n.Url))?.Url ?? "http://127.0.0.1:5050";
                 tasks.Add(Task.Run(async () =>
                 {
                     try
                     {
                         using var proxyReq = new HttpRequestMessage(HttpMethod.Post, hrAgentUrl.TrimEnd('/') + "/api/clear");
-                        proxyReq.Headers.Add("X-Username", Uri.EscapeDataString("Team中控"));
+                        proxyReq.Headers.Add("X-Username", Uri.EscapeDataString("ceo"));
                         using var proxyRes = await _httpClient.SendAsync(proxyReq);
                     }
                     catch { /* 忽略异常 */ }
@@ -418,7 +420,7 @@ class Program
                     try
                     {
                         using var proxyReq = new HttpRequestMessage(HttpMethod.Post, callAgentUrl.TrimEnd('/') + "/api/clear");
-                        proxyReq.Headers.Add("X-Username", Uri.EscapeDataString("Team中控"));
+                        proxyReq.Headers.Add("X-Username", Uri.EscapeDataString("ceo"));
                         using var proxyRes = await _httpClient.SendAsync(proxyReq);
                     }
                     catch { /* 忽略 */ }
@@ -459,16 +461,16 @@ class Program
                 // 👉 2. 把它塞给大模型，命令它用这个地址去改本地配置，最后再吐出带这个地址的 JSON
                 var prompt = $@"老板下达了开设新公司的指令，业务描述：【{reqData.Description}】。
 请你作为一个高级HR兼架构师，完成以下连串任务：
-1. 编排一个包含 1 - 21 个核心员工的团队，生成他们的名字和岗位头衔，以及详细的个人简历（包含专业背景、工作经验、性格特点等）。
+1. 编排一个包含 1 - 21 个核心员工的团队，生成他们的名字和岗位头衔，以及详细的个人简历（包含专业背景、工作经验、性格特点等）不需要ceo，因为用户就是 ceo。
 2. 注意：所有生成员工的 Url 必须全部统一填为 ""{targetUrl}""。
 3. 调用你的本地工具，读取并修改你自己的 `appsettings.json`，把这些新员工信息补充到你的 `PeerNodes` 字典中，PeerNodes 字典格式如下。
 ""PeerNodes"": {{
     ""陈智远"": {{
       ""Name"": ""陈智远"",
       ""Url"": ""{targetUrl}"",
-      ""Role"": ""首席执行官 CEO"",
-      ""Resume"": ""陈智远，清华大学MBA，拥有15年互联网行业高管经验，曾带领两家公司成功上市。性格沉稳果断，擅长战略布局与团队资源整合。"",
-      ""Description"": ""负责公司整体战略规划、业务发展方向决策、重大合作伙伴关系建立、投融资事务管理，统筹公司各部门协同运作，对董事会负责""
+      ""Role"": ""产品经理"",
+      ""Resume"": ""清华大学 MBA，深耕互联网产品领域 15 年。具备极强的商业敏锐度与全局战略思维，拥有多款亿级用户量“爆款”产品的从 0 到 1 及规模化增长经验。擅长在复杂业务环境下整合跨职能资源，以数据驱动决策，实现产品价值与商业利润的双重突破。"",
+      ""Description"": ""负责产品全生命周期的战略规划与路线图制定，深度洞察市场趋势以识别商业机会。凭借丰富的行业经验，精准平衡用户体验与商业效益，通过高效的资源整合驱动产品持续创新与市场准入。""
     }}
 }}
 
@@ -488,7 +490,7 @@ class Program
 
                 var chatReq = new ChatRequest { message = prompt, modelIndex = 0 };
                 using var agentReq = new HttpRequestMessage(HttpMethod.Post, callAgentUrl.TrimEnd('/') + "/api/chat");
-                agentReq.Headers.Add("X-Username", Uri.EscapeDataString("Team中控"));
+                agentReq.Headers.Add("X-Username", Uri.EscapeDataString("ceo"));
                 agentReq.Content = new StringContent(JsonSerializer.Serialize(chatReq, typeof(ChatRequest), AppJsonContext.Default), Encoding.UTF8, "application/json");
 
                 try
@@ -810,6 +812,43 @@ class Program
                 res.ContentType = "application/json; charset=utf-8";
                 await res.OutputStream.WriteAsync(Encoding.UTF8.GetBytes("{\"status\":\"ok\"}"));
             }
+            else if (path == "/api/agent_task" && req.HttpMethod == "POST")
+            {
+                string username = Uri.UnescapeDataString(req.Headers["X-Username"] ?? "");
+                string targetUrl = string.IsNullOrEmpty(_config.MasterNodeUrl) ? "http://127.0.0.1:5050" : _config.MasterNodeUrl;
+
+                // 寻址对应的底层节点
+                if (_config.PeerNodes.TryGetValue(username, out var nodeInfo) && !string.IsNullOrEmpty(nodeInfo.Url))
+                {
+                    targetUrl = nodeInfo.Url;
+                }
+
+                using var reader = new StreamReader(req.InputStream);
+                string body = await reader.ReadToEndAsync();
+
+                try
+                {
+                    var proxyReq = new HttpRequestMessage(HttpMethod.Post, targetUrl.TrimEnd('/') + "/api/agent_task");
+                    proxyReq.Headers.Add("X-Username", Uri.EscapeDataString(username));
+                    string currentTeamUrl = $"http://{req.Url?.Host}:{req.Url?.Port}";
+                    proxyReq.Headers.Add("X-Team-Url", Uri.EscapeDataString(currentTeamUrl));
+
+                    proxyReq.Content = new StringContent(body, Encoding.UTF8, "application/json");
+
+                    using var proxyRes = await _httpClient.SendAsync(proxyReq);
+                    proxyRes.EnsureSuccessStatusCode();
+
+                    // agent_task 返回的是纯文本的执行结果
+                    string proxyResStr = await proxyRes.Content.ReadAsStringAsync();
+                    res.ContentType = "text/plain; charset=utf-8";
+                    await res.OutputStream.WriteAsync(Encoding.UTF8.GetBytes(proxyResStr));
+                }
+                catch (Exception ex)
+                {
+                    res.StatusCode = 500;
+                    Console.WriteLine($"[代理 AgentTask 异常] {ex.Message}");
+                }
+            }
             else
             {
                 res.StatusCode = 404;
@@ -931,35 +970,50 @@ class Program
         .guide-right p { margin-top: 0; margin-bottom: 10px; font-size: 0.95rem; color: #444; line-height: 1.5; }
         .guide-right ul, .guide-right ol { margin-top: 0; padding-left: 20px; font-size: 0.95rem; color: #444;}
 
-        .top-btn {
-            padding: 10px 20px;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: bold;
-            font-size: 0.95rem;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 10px rgba(0,0,0,0.1);
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-        }
-        .top-btn-clear {
-            background: linear-gradient(135deg, #e67e22, #d35400); /* 暖橙渐变 */
-            color: #fff;
-        }
-        .top-btn-clear:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 15px rgba(211, 84, 0, 0.3);
-        }
-        .top-btn-create {
-            background: linear-gradient(135deg, #4a3f35, #2c251f); /* 沉稳深咖渐变 */
-            color: #fff;
-        }
-        .top-btn-create:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 15px rgba(44, 37, 31, 0.35);
-        }
+.top-btn {
+    padding: 10px 18px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-weight: bold;
+    font-size: 0.95rem;
+    color: #fff;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.3s ease; 
+}
+
+.top-btn:hover {
+    transform: translateY(-3px);
+    filter: brightness(1.1);
+}
+.top-btn:active {
+    transform: translateY(0);
+    filter: brightness(0.9);
+}
+
+.btn-create   { background: linear-gradient(135deg, #4a3f35, #2c251f); box-shadow: 0 4px 10px rgba(44, 37, 31, 0.3); }
+.btn-deploy   { background: linear-gradient(135deg, #16a085, #27ae60); box-shadow: 0 4px 10px rgba(39, 174, 96, 0.3); }
+.btn-board    { background: linear-gradient(135deg, #2980b9, #8e44ad); box-shadow: 0 4px 10px rgba(41, 128, 185, 0.3); }
+.btn-sop      { background: linear-gradient(135deg, #34495e, #2c3e50); box-shadow: 0 4px 10px rgba(44, 62, 80, 0.3); }
+
+.btn-boss     { background: linear-gradient(135deg, #27ae60, #2ecc71); box-shadow: 0 4px 10px rgba(39, 174, 96, 0.3); }
+.btn-clear    { background: linear-gradient(135deg, #e67e22, #d35400); box-shadow: 0 4px 10px rgba(230, 126, 34, 0.3); }
+.btn-bankrupt { background: linear-gradient(135deg, #c0392b, #8e44ad); box-shadow: 0 4px 10px rgba(192, 57, 43, 0.3); }
+
+.btn-group-wrapper {
+    display: flex;
+    flex-direction: column;
+    gap: 12px; 
+    margin-top: auto; 
+    padding-top: 15px;
+}
+.btn-row {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
 
         .desk-grid {
             display: grid;
@@ -1518,29 +1572,38 @@ class Program
 <body style="margin:0; padding:0; width:100vw; height:100vh; background-color:#ab9980; ">
     
     <div class="header-container">
-        <div class="header-left">
-            <div style="display: flex; flex-direction: column; align-items: flex-start; cursor: pointer; margin-bottom: 12px; transition: transform 0.2s;" onclick="openLicenseModal()" title="点击修改公司并申请执照" onmouseover="this.style.transform='translateX(5px)'" onmouseout="this.style.transform='none'">
-                <h1 style="margin: 0; display: flex; align-items: center; gap: 10px; font-size: 2.2rem;">
-                    🏢 <span id="companyNameDisplay" style="background: linear-gradient(120deg, var(--pipi-cyan), var(--pipi-magenta));">未命名公司</span>
-                </h1>
-                <span id="licenseTag" style="margin-top: 6px; font-size: 0.75rem; padding: 4px 8px; border-radius: 6px; background: #e74c3c; color: white; font-weight: bold; letter-spacing: 1px; box-shadow: 0 4px 10px rgba(0,0,0,0.1);">未获取营业执照</span>
-            </div>
-            <p>欢迎回来！这是您的团队。点击空位可以单招。</p>
-            <div style="display: flex; gap: 10px; margin-top: 15px; flex-wrap: wrap;">
-                <button onclick="clearAllMemory()" class="top-btn top-btn-clear">🧹 一键清空记忆</button>
-                <button onclick="openCreateCompanyModal()" class="top-btn top-btn-create">🚀 一键开设公司</button>
-                <button onclick="openBoardModal()" class="top-btn" style="background: linear-gradient(135deg, #2980b9, #8e44ad); color:#fff; box-shadow: 0 4px 10px rgba(41,128,185,0.3);">📊 项目看板</button>
-                <button onclick="openSopModal()" class="top-btn" style="background: linear-gradient(135deg, #34495e, #2c3e50); color:#fff;">📜 公司制度/SOP</button>
-                <button onclick="openBossMarket()" class="top-btn" style="background: linear-gradient(135deg, #27ae60, #2ecc71); color:#fff; box-shadow: 0 4px 10px rgba(39,174,96,0.3);">💼 BOSS 直聘</button>
-                <button onclick="bankruptcy()" class="top-btn" style="background: linear-gradient(135deg, #c0392b, #8e44ad); color:#fff;">💥 一键破产</button>
-            </div>
-        </div>
 
-        <div class="guide-right" id="onboardingGuide">
-            <div style="color: #888; font-style: italic; text-align: center; margin-top: 30px;">
-                暂无公司对接指南。<br>请点击左侧【🚀 一键开设公司】让 HR 自动生成业务蓝图。
-            </div>
+
+<div class="header-left" style="justify-content: flex-start; padding-bottom: 5px;">
+    <div style="display: flex; flex-direction: column; align-items: flex-start; cursor: pointer; margin-bottom: 12px; transition: transform 0.2s;" onclick="openLicenseModal()" title="点击修改公司并申请执照" onmouseover="this.style.transform='translateX(5px)'" onmouseout="this.style.transform='none'">
+        <h1 style="margin: 0; display: flex; align-items: center; gap: 10px; font-size: 2.2rem;">
+            🏢 <span id="companyNameDisplay" style="background: linear-gradient(120deg, var(--pipi-cyan), var(--pipi-magenta));">未命名公司</span>
+        </h1>
+        <span id="licenseTag" style="margin-top: 6px; font-size: 0.75rem; padding: 4px 8px; border-radius: 6px; background: #e74c3c; color: white; font-weight: bold; letter-spacing: 1px; box-shadow: 0 4px 10px rgba(0,0,0,0.1);">未获取营业执照</span>
+    </div>
+    <p>欢迎回来！这是您的团队。点击空位可以单招。</p>
+
+    <div class="btn-group-wrapper">
+        <div class="btn-row">
+            <button onclick="openCreateCompanyModal()" class="top-btn btn-create">🚀 一键开设公司</button>
+            <button onclick="openCeoModal()" class="top-btn btn-deploy">🎯 部署战略/项目</button>
+            <button onclick="openBoardModal()" class="top-btn btn-board">📊 项目看板</button>
+            <button onclick="openSopModal()" class="top-btn btn-sop">📜 公司制度/SOP</button>
         </div>
+        <div class="btn-row">
+            <button onclick="openBossMarket()" class="top-btn btn-boss">💼 BOSS 直聘</button>
+            <button onclick="clearAllMemory()" class="top-btn btn-clear">🧹 一键清空记忆</button>
+            <button onclick="bankruptcy()" class="top-btn btn-bankrupt">💥 一键破产</button>
+        </div>
+    </div>
+</div>
+
+<div class="guide-right" style="background: rgba(255,255,255,0.85);">
+    <div id="onboardingGuide" style="color: #333; font-size: 0.95rem; line-height: 1.5;">
+        <h3 style="margin-top:0; color:#2c3e50;">🏢 公司简介与工作指南</h3>
+        <p style="color:#666;">HR还未配置公司简介... 点击左侧「一键开设公司」生成团队及指南。</p>
+    </div>
+</div>
     </div>
 
     <div class="desk-grid" id="mainDeskGrid">
@@ -1709,6 +1772,26 @@ class Program
 </div>
 
 
+<div id="ceoModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:10000; align-items:center; justify-content:center; backdrop-filter:blur(3px);">
+    <div style="background:#fff; padding:25px; border-radius:15px; width:450px; display:flex; flex-direction:column; gap:12px; box-shadow:0 10px 30px rgba(0,0,0,0.2);">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <h3 style="margin:0; color:#2c3e50; font-size: 1.2rem;">👑 CEO 战略部署中心</h3>
+            <button onclick="closeModal('ceoModal')" style="border:none; background:none; font-size:20px; cursor:pointer; color:#666;">✖</button>
+        </div>
+        <p style="font-size:12px; color:#666; margin:0;">请在此下达全局战略或新项目需求。提交后将自动交由 PM (ceo) 拆解，并更新至项目看板，全员自动跟进！</p>
+
+        <textarea id="ceoTaskInput" placeholder="老板，请描述需求... (如: 写一个贪吃蛇游戏并部署到本地)"
+            style="padding:12px; border:1px solid #ddd; border-radius:8px; outline:none; height:120px; resize:none; font-family:inherit; font-size:14px; background: #f8fafc;"></textarea>
+
+        <div style="display:flex; gap:10px; margin-top:10px;">
+            <button onclick="dispatchCeoTask()" style="flex:1; padding:12px; background:linear-gradient(135deg, #16a085, #27ae60); color:#fff; border:none; border-radius:8px; font-weight:bold; cursor:pointer; box-shadow:0 4px 10px rgba(39,174,96,0.3); transition: transform 0.2s;">
+                🚀 一键发布战略并更新看板
+            </button>
+        </div>
+    </div>
+</div>
+
+
 <div id="loadingOverlay" class="hr-loading-container">
     <div class="hr-spinner"></div>
     <div class="hr-loading-text">HR 正在拼命招人中...</div>
@@ -1725,6 +1808,162 @@ class Program
         function closeModal(id) {
             document.getElementById(id).style.display = 'none';
         }
+
+
+function openCeoModal() {
+    document.getElementById('ceoTaskInput').value = ''; // 打开时清空上次内容
+    document.getElementById('ceoModal').style.display = 'flex';
+}
+
+async function dispatchCeoTask() {
+    const taskContent = document.getElementById('ceoTaskInput').value.trim();
+    if (!taskContent) return alert("老板，战略内容不能为空！你得先画大饼啊！");
+    closeModal('ceoModal');
+    const companySop = window.teamConfig?.CompanySOP || "";
+    let pmName = "ceo";
+    const nodes = Object.entries(window.teamConfig?.PeerNodes || {}).filter(([name, info]) => {
+        return name && name !== 'undefined' && name.toLowerCase() !== 'ceo';
+    });
+
+    if (nodes.length === 0) {
+        return alert("公司除了老板没别人了，先去招人吧！");
+    }
+    const teamInfo = nodes.map(([name, info]) => 
+        `- 姓名: ${name}, 岗位: ${info.Role || info.role || '未知'}, 职责: ${info.Description || info.description || '暂无'}`
+    ).join('\n');
+
+
+
+const planPrompt = `【全局任务调度与执行编排引擎】
+接收到原始指令：
+${taskContent}
+
+当前可用执行单元及其能力边界如下：
+${teamInfo}
+
+请作为“绝对务实、结果导向”的智能调度中枢（Dispatcher），动态感知指令的真实业务规模，并直接输出纯 JSON 格式的终态执行任务。
+
+【核心调度逻辑】（极其重要，必须严格遵循）
+1. **动态规模感知与自适应拆解（去领域化）**：
+   - 【单点/线性动作】：当指令目标单一、步骤明确、无复杂前置依赖时（闭环成本极低），**保持极度克制**。直接将其转化为 1 个原子动作，匹配给唯一最合适的执行单元。绝对禁止主观扩充流程或臆想“前期调研”。
+   - 【系统/复合工程】：当指令具有宏观性、包含多模块或需要跨能力域协同协作时，**必须进行降维解构**。跳过所有“需求分析”、“架构规划”、“开会统筹”等务虚环节，直接将其平行拆解为【各子领域第一阶段的实质性落地动作】，并按能力图谱分别派发。
+2. **绝对泛化与结果约束**：无论指令属于数字系统、物理控制、文本处理还是逻辑运算，调度中枢只关心“实质性产出”。所有拆解出的任务，必须是可以立即动手的终端执行动作，拒绝一切中间态文档。
+3. **动作定义标准**：任务标题 (title) 必须是简练的动宾结构，直接指明操作对象与最终结果。
+
+【严格输出规范】
+禁止使用任何工具！禁止包含任何解释性文字！禁止使用 Markdown 的 \`\`\`json 标签！直接且仅输出以下 JSON 字符串：
+{
+  "project_name": "提炼精准的指令归纳名称",
+  "tasks": [
+    {
+      "title": "具体要执行的实质性落地动作",
+      "assignee": "分配的执行单元姓名（必须从输入名单中精确提取）"
+    }
+  ]
+}`;
+
+
+    document.getElementById('loadingOverlay').style.display = 'flex';
+    document.querySelector('.hr-loading-text').innerText = `规划项目计划并生成看板...`;
+    document.querySelector('.hr-loading-subtext').innerText = `ceo开始思考中...`;
+    try {
+        await fetch('/api/clear', {
+            method: 'POST',
+            headers: { 'X-Username': encodeURIComponent(pmName) }
+        }).catch(e => console.warn("静默清理ceo上下文失败", e));
+
+
+        // 获取计划
+        const res = await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Username': encodeURIComponent(pmName) },
+            body: JSON.stringify({
+                message: planPrompt,
+                modelIndex: window.teamConfig?.PeerNodes?.[pmName]?.ModelIndex || 0,
+                sop: companySop
+            })
+        });
+
+        // 拼装流式返回的数据
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let fullText = '';
+        let buffer = '';
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const parts = buffer.split('|||END|||');
+            buffer = parts.pop();
+            for (const part of parts) {
+                if(!part.trim()) continue;
+                try {
+                    const msg = JSON.parse(part);
+                    // 抓取模型输出的文本
+                    if (msg.type === 'final' || msg.type === 'tool_result') fullText += msg.content;
+                } catch(e){}
+            }
+        }
+
+        // 3. 粗暴且安全的 JSON 清洗提取
+        let jsonStr = fullText.replace(/```json/gi, '').replace(/```/g, '').trim();
+        const startIdx = jsonStr.indexOf('{');
+        const endIdx = jsonStr.lastIndexOf('}');
+        if (startIdx >= 0 && endIdx > startIdx) {
+            jsonStr = jsonStr.substring(startIdx, endIdx + 1);
+        }
+
+        const boardData = JSON.parse(jsonStr);
+
+
+        if (boardData.tasks && Array.isArray(boardData.tasks)) {
+            boardData.tasks.forEach((t, index) => {
+                if (!t.id) {
+                    // 使用浏览器原生的 crypto 接口生成规范 UUID 并截取 8 位
+                    t.id = crypto.randomUUID().replace(/-/g, '').substring(0, 8);
+                    // 或者按你说的最简单的顺延： t.id = `task_${index + 1}`;
+                }
+                if (!t.status) {
+                    t.status = "todo";
+                }
+            });
+        }
+
+        // 4. 将 AI 生成的计划同步到本地系统进行立项
+        await fetch('/api/board', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(boardData)
+        });
+        await refreshBoard(); // 刷新网页端的看板显示
+
+        // 5. 第二轮：带着生成好的任务去催促 PM 挨个分配调用
+        document.querySelector('.hr-loading-text').innerText = `立项成功！正在让【${pmName}】开始委派任务...`;
+        const execPrompt = `【项目分发阶段】\n刚才你制定的项目【${boardData.project_name}】已成功通过底层代码写入系统看板！\n以下是系统确认后的带 ID 任务清单：\n${JSON.stringify(boardData.tasks, null, 2)}\n\n现在，请你作为统筹者，立刻使用 delegate_task 工具，挨个向上述负责人下发工作（务必把 JSON 中的 id 传给 task_id 参数）。你可以一次性发起多个工具调用来分发任务。`;
+
+        // 👇 核心修改：改为请求 /api/agent_task，并强制声明指令来自 ceo
+        fetch('/api/agent_task', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Username': encodeURIComponent(pmName) },
+            body: JSON.stringify({
+                message: execPrompt,
+                modelIndex: window.teamConfig?.PeerNodes?.[pmName]?.ModelIndex || 0,
+                sop: companySop,
+                caller: "ceo" // 强制声明老板身份
+            })
+        }).catch(e => console.error('后台分发任务异常:', e));
+
+        alert(`✅ 项目【${boardData.project_name}】已成功立项并更新看板！\n【${pmName}】正在后台开始委派任务给员工，请稍后在看板中查看进度。`);
+        document.getElementById('ceoTaskInput').value = '';
+
+    } catch (e) {
+        alert("❌ 项目生成或分发失败，可能是 AI 脑子抽风没按格式返回 JSON，请重试或检查后台日志。\n" + e.message);
+    } finally {
+        document.getElementById('loadingOverlay').style.display = 'none';
+    }
+}
+
+
 
 // 动态计算并适配网格宽度 (手机端受 CSS 控制永远两列)
 function adjustGridColumns() {
@@ -1999,7 +2238,7 @@ function ensureOneEmptyDesk() {
 
                 let index = 0;
                 for (const [name, info] of Object.entries(cfg.PeerNodes)) {
-                    if (name === 'Team中控') continue;
+                    if (name === 'ceo') continue;
                     const desk = createDeskElement(); // 动态生成工位
                     const role = info.Role || info.role || '资深员工';
                     renderEmployeeUI(desk, name, role);
@@ -2846,29 +3085,6 @@ async function confirmTask() {
 
     // 1. 原本的拼接逻辑不需要了，还原即可
     taskContent = `用户需求：${taskContent}`;
-    taskContent += `
-
-【系统级强制规范 - 必读】：
-请根据你的岗位头衔（Role）对号入座，严格执行以下SOP：
-
-▶ 若你是 项目经理/CEO/统筹者（负责拆解和派发任务）：
-1. 动手前优先审视【项目看板】。若与老项目无关，调用 update_project_board 建立新计划。若是与老项目有关那就按照老项目的进度接着执行下去。
-2. 委派留言中【必须】附带任务ID，并强制要求对方：“做完后必须调用 update_task_status 标记为 done！”
-3. 你自己很少干活。当用户提出需求的时候你负责统筹员工开始工作。
-4. 必须严格按照 【公司最高主旨与工作流流程说明】 去安排流程。
-
-▶ 若你是 基层员工/执行者（负责具体的代码、工具、检索执行）：
-1. 当你的工作彻底完成后，你【必须】主动调用 update_task_status 工具，将老板派给你的 任务ID 状态更新为 done！
-2. 状态更新成功后，再输出最终的工作汇报。
-3. 若你需要同事援助，可优先呼叫同事援助。
-
-
-【注意】
-你们公司内部就可以满足用户需求，直接基于你们团队的工作给与用户最终结果。避免只开会不干活的情况。用户需要的是最终结果，碰到不确定的可以同事之间内部讨论。用户只在意最终结果，不要只给方案不具体做事。
-
-
-`;
-
     closeModal('taskModal');
 
     const mIdx = window.teamConfig?.PeerNodes?.[currentTargetName]?.ModelIndex || 0;
