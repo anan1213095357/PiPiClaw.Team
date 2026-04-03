@@ -757,12 +757,13 @@ class Program
                     if (newBoard != null)
                     {
                         _config.Projects ??= new List<ProjectBoard>();
+                        bool isDispatchNeeded = false; // 标记是否需要触发后端全局派发
+                        var tasksToDispatch = new List<ProjectTask>();
 
                         // 情况A：只更新单个任务状态 (普通员工调用)
                         if (newBoard.Tasks != null && newBoard.Tasks.Count == 1 && string.IsNullOrEmpty(newBoard.ProjectName))
                         {
                             var updateTask = newBoard.Tasks[0];
-                            // 👉 跨所有项目全局搜索这个任务 ID
                             var existingTask = _config.Projects.SelectMany(p => p.Tasks).FirstOrDefault(t => t.Id == updateTask.Id);
                             if (existingTask != null)
                             {
@@ -774,11 +775,12 @@ class Program
                         // 情况B：新增拆解任务 (CEO调用)
                         else if (!string.IsNullOrEmpty(newBoard.ProjectName))
                         {
-                            // 👉 按项目名查找，存在则追加，不存在则新建项目
+                            isDispatchNeeded = true; // 老板立项，激活派发引擎！
                             var existingProject = _config.Projects.FirstOrDefault(p => p.ProjectName == newBoard.ProjectName);
                             if (existingProject == null)
                             {
                                 _config.Projects.Add(newBoard);
+                                tasksToDispatch.AddRange(newBoard.Tasks);
                             }
                             else
                             {
@@ -791,13 +793,67 @@ class Program
                                         if (string.IsNullOrWhiteSpace(t.Assignee)) t.Assignee = "待认领";
 
                                         var existingT = existingProject.Tasks.FirstOrDefault(x => x.Title == t.Title || x.Id == t.Id);
-                                        if (existingT == null) existingProject.Tasks.Add(t);
+                                        if (existingT == null)
+                                        {
+                                            existingProject.Tasks.Add(t);
+                                            tasksToDispatch.Add(t);
+                                        }
                                         else existingT.Status = t.Status;
                                     }
                                 }
                             }
                         }
                         File.WriteAllText(_configPath, JsonSerializer.Serialize(_config, typeof(AppConfig), AppJsonContext.Default), Encoding.UTF8);
+                        if (isDispatchNeeded && tasksToDispatch.Count > 0)
+                        {
+                            string teamUrl = $"http://{req.Url?.Host}:{req.Url?.Port}";
+                            string companySop = _config.CompanySOP ?? "";
+                            string projectName = newBoard.ProjectName;
+                            _ = Task.Run(async () =>
+                            {
+                                string accumulatedContext = "";
+                                foreach (var t in tasksToDispatch)
+                                {
+                                    if (string.IsNullOrWhiteSpace(t.Assignee) || t.Assignee == "待认领" || t.Assignee.ToLower() == "ceo") continue;
+
+                                    if (_config.PeerNodes.TryGetValue(t.Assignee, out var nodeInfo) && !string.IsNullOrEmpty(nodeInfo.Url))
+                                    {
+                                        try
+                                        {
+                                            string targetUrl = nodeInfo.Url.TrimEnd('/') + "/api/agent_task";
+                                            string execPrompt = $"【系统最高指令】\n所属项目：{projectName}\n你的任务目标：{t.Title}\n";
+                                            if (!string.IsNullOrWhiteSpace(accumulatedContext))
+                                            {
+                                                execPrompt += $"\n【前置任务交付的上下文参考】（请基于以下结果继续推进你的工作）：\n{accumulatedContext}\n";
+                                            }
+                                            execPrompt += "\n请立刻开始执行此任务。完成后请直接用自然语言输出结果，底层会自动为你更新项目看板。";
+                                            var proxyReq = new HttpRequestMessage(HttpMethod.Post, targetUrl);
+                                            proxyReq.Headers.Add("X-Username", Uri.EscapeDataString(t.Assignee));
+                                            proxyReq.Headers.Add("X-Team-Url", Uri.EscapeDataString(teamUrl));
+                                            var reqBody = new ChatRequest
+                                            {
+                                                message = execPrompt,
+                                                modelIndex = nodeInfo.ModelIndex,
+                                                caller = "ceo",
+                                                taskId = t.Id,
+                                                sop = companySop
+                                            };
+                                            proxyReq.Content = new StringContent(JsonSerializer.Serialize(reqBody, typeof(ChatRequest), AppJsonContext.Default), Encoding.UTF8, "application/json");
+                                            using var proxyRes = await _httpClient.SendAsync(proxyReq);
+                                            proxyRes.EnsureSuccessStatusCode();
+                                            string taskResult = await proxyRes.Content.ReadAsStringAsync();
+                                            accumulatedContext += $"\n--- 同事 [{t.Assignee}] 完成了前置任务 [{t.Title}]，交付成果如下 ---\n{taskResult}\n";
+                                            await Task.Delay(3000);
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Console.WriteLine($"[中控后台派发异常] 派发给 {t.Assignee} 失败: {ex.Message}");
+                                            accumulatedContext += $"\n--- 警告：同事 [{t.Assignee}] 的前置任务 [{t.Title}] 执行异常 ---\n系统反馈：{ex.Message}\n";
+                                        }
+                                    }
+                                }
+                            });
+                        }
                     }
                     res.StatusCode = 200;
                     await res.OutputStream.WriteAsync(Encoding.UTF8.GetBytes("{\"status\":\"ok\"}"));
@@ -2064,7 +2120,6 @@ function deleteStrategyTask(idx) {
     renderStrategyTasks(); // 刷新列表
 }
 
-// 确认发布按钮：将修改后的结果正式发给后端与底层系统
 async function confirmAndDispatchStrategy() {
     const boardData = window.tempStrategyBoardData;
     boardData.project_name = document.getElementById('editProjectName').value.trim() || "未命名新项目";
@@ -2077,42 +2132,25 @@ async function confirmAndDispatchStrategy() {
     }
 
     closeModal('strategyEditModal');
-
-    // 重新开启原来的 loading 动画
     document.getElementById('loadingOverlay').style.display = 'flex';
-    document.querySelector('.hr-loading-text').innerText = '正在立项并强制委派编排后的任务...';
-
-    const pmName = "ceo";
-    const companySop = window.teamConfig?.CompanySOP || "";
+    document.querySelector('.hr-loading-text').innerText = '正在立项并将任务托管给中控后台...';
 
     try {
-        // 4. 将 AI 加上人为二次修改的计划，同步到本地系统进行立项
+        // 👇 你只需要把 JSON 丢给后端一次！剩下的全部交由 C# 接管！
         await fetch('/api/board', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(boardData)
         });
+
         await refreshBoard(); // 刷新网页端的看板显示
 
-        // 5. 第二轮：带着确认好的任务去催促 PM 挨个分配调用
-        const execPrompt = `【项目分发阶段】\n刚才老板制定的项目【${boardData.project_name}】已确认定稿并写入看板！\n以下是老板亲自调整后的带 ID 任务清单：\n${JSON.stringify(boardData.tasks, null, 2)}\n\n现在，请你作为统筹者，立刻使用 delegate_task 工具，挨个向上述负责人下发工作（务必把 JSON 中的 id 传给 task_id 参数）。`;
-
-        fetch('/api/agent_task', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-Username': encodeURIComponent(pmName) },
-            body: JSON.stringify({
-                message: execPrompt,
-                modelIndex: window.teamConfig?.PeerNodes?.[pmName]?.ModelIndex || 0,
-                sop: companySop,
-                caller: "ceo" 
-            })
-        }).catch(e => console.error('后台分发任务异常:', e));
-
-        alert(`✅ 项目【${boardData.project_name}】已根据您的编排成功立项！\n【${pmName}】正在后台开始精确委派任务。`);
+        // 搞定！现在就算你立刻按下 F5 刷新网页，或者拔掉电脑电源，后端的 C# 也会忠实地把任务发完。
+        alert(`✅ 项目【${boardData.project_name}】已成功立项并托管给中控！\n中控后台正在向各位员工并发推送指令，您现在可以安全地刷新页面或关闭浏览器了。`);
         document.getElementById('ceoTaskInput').value = '';
 
     } catch (e) {
-        alert("❌ 最终立项或分发失败，请检查网络：" + e.message);
+        alert("❌ 立项失败，请检查网络：" + e.message);
     } finally {
         document.getElementById('loadingOverlay').style.display = 'none';
     }
