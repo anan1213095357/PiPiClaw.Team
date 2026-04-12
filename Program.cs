@@ -25,7 +25,7 @@ namespace PiPiClaw.Team;
 [JsonSerializable(typeof(ProjectBoard))]
 [JsonSerializable(typeof(ProjectTask))]
 [JsonSerializable(typeof(List<ProjectTask>))]
-
+[JsonSerializable(typeof(List<string>))]
 internal partial class AppJsonContext : JsonSerializerContext { }
 public class CreateCompanyReq
 {
@@ -45,6 +45,7 @@ public class NodeInfoTemplate
     public string? Description { get; set; }
     public string? Resume { get; set; }
     public int ModelIndex { get; set; } = 0;
+    public List<string> Contacts { get; set; } = [];
 }
 public class ChatRequest
 {
@@ -70,6 +71,7 @@ public class NodeInfo
     [JsonPropertyName("Description")] public string? Description { get; set; }
     [JsonPropertyName("Resume")] public string? Resume { get; set; }
     [JsonPropertyName("ModelIndex")] public int ModelIndex { get; set; } = 0;
+    [JsonPropertyName("Contacts")] public List<string> Contacts { get; set; } = [];
 }
 public class ProjectTask
 {
@@ -1689,7 +1691,11 @@ class Program
                     <div id="modelFetchStatus" style="font-size:11px; color:#999; margin-top:4px;">填入上方 URL 后自动连接节点获取...</div>
                 </div>
             </details>
-
+<div id="contactSelectArea" style="margin-top:8px; display:none;">
+    <label style="font-size:12px; color:#333; font-weight:bold; display:block; margin-bottom:4px;">🔗 赋予 Ta 的专属通讯录 (知晓队友能力)</label>
+    <div id="contactCheckboxes" style="max-height:100px; overflow-y:auto; border:1px solid #ddd; border-radius:8px; padding:8px; font-size:12px; background:#f9f9f9;">
+        </div>
+</div>
             <div style="display:flex; gap:10px; margin-top:10px;">
                 <button onclick="confirmRecruit()"
                     style="flex:1; padding:10px; background:#333; color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:bold;">办理入职</button>
@@ -2194,8 +2200,24 @@ function createDeskElement() {
             currentTargetDesk = desk;
             document.getElementById('recruitName').value = '';
             document.getElementById('recruitRole').value = '';
+            document.getElementById('recruitDesc').value = '';
+            document.getElementById('recruitResume').value = '';
             document.getElementById('recruitUrl').value = '';
-            document.getElementById('recruitModal').style.display = 'flex';
+            document.getElementById('recruitModal').querySelector('h3').innerText = '🤝 招募新员工';
+            
+            fetch('/api/config').then(r => r.json()).then(cfg => {
+                const cbContainer = document.getElementById('contactCheckboxes');
+                cbContainer.innerHTML = '';
+                if (cfg && cfg.PeerNodes) {
+                    Object.keys(cfg.PeerNodes).forEach(peerName => {
+                        if (peerName === 'ceo') return;
+                        cbContainer.innerHTML += `<label style="display:block; margin:4px 0; cursor:pointer;"><input type="checkbox" value="${peerName}"> 👤 ${peerName} <span style="color:#888;">- ${cfg.PeerNodes[peerName].Role || '员工'}</span></label>`;
+                    });
+                }
+                document.getElementById('contactSelectArea').style.display = 'block';
+                document.getElementById('recruitModal').style.display = 'flex';
+            });
+
         } else if (desk.classList.contains('at-work')) {
             currentTargetDesk = desk;
             currentTargetName = desk.querySelector('.id-card-name').innerText;
@@ -2926,7 +2948,6 @@ async function openLicenseModal() {
                 const nodeInfo = cfg.PeerNodes[currentTargetName];
                 if(nodeInfo) {
                     document.getElementById('recruitName').value = currentTargetName;
-                    // 🌟 兼容大小写读取属性
                     document.getElementById('recruitRole').value = nodeInfo.Role || nodeInfo.role || '';
                     document.getElementById('recruitDesc').value = nodeInfo.Description || nodeInfo.description || '';
                     document.getElementById('recruitResume').value = nodeInfo.Resume || nodeInfo.resume || '';
@@ -2935,6 +2956,21 @@ async function openLicenseModal() {
                     const savedIndex = nodeInfo.ModelIndex !== undefined ? nodeInfo.ModelIndex : (nodeInfo.modelIndex || 0);
                     document.getElementById('recruitModelIndex').value = savedIndex;
                     fetchNodeModels(savedIndex);
+
+                    // 👇 核心修复：工位上点击修改老员工时，动态拉取并回显通讯录打勾状态
+                    const myContacts = nodeInfo.Contacts || nodeInfo.contacts || [];
+                    const cbContainer = document.getElementById('contactCheckboxes');
+                    if (cbContainer) {
+                        cbContainer.innerHTML = '';
+                        if (cfg && cfg.PeerNodes) {
+                            Object.keys(cfg.PeerNodes).forEach(peerName => {
+                                if (peerName === currentTargetName || peerName === 'ceo') return; // 隐藏自己和老板
+                                const isChecked = myContacts.includes(peerName) ? 'checked' : '';
+                                cbContainer.innerHTML += `<label style="display:block; margin:4px 0; cursor:pointer;"><input type="checkbox" value="${peerName}" ${isChecked}> 👤 ${peerName} <span style="color:#888;">- ${cfg.PeerNodes[peerName].Role || '员工'}</span></label>`;
+                            });
+                        }
+                        document.getElementById('contactSelectArea').style.display = 'block';
+                    }
 
                     document.getElementById('recruitModal').querySelector('h3').innerText = '📝 修改员工信息';
                     document.getElementById('recruitModal').style.display = 'flex';
@@ -3145,18 +3181,24 @@ async function openLicenseModal() {
             }
         }
 
-        async function confirmRecruit() {
+       async function confirmRecruit() {
             const name = document.getElementById('recruitName').value.trim();
             const role = document.getElementById('recruitRole').value.trim() || '新晋员工';
             const desc = document.getElementById('recruitDesc').value.trim() || '暂无说明';
             const resume = document.getElementById('recruitResume').value.trim() || '';
             const url = document.getElementById('recruitUrl').value.trim();
-
             const modelIdx = parseInt(document.getElementById('recruitModelIndex').value) || 0;
+
+            // 👇 核心修复：不论是新增还是修改，点击保存时强制抓取勾选的队友名单
+            let contacts = [];
+            const checkboxes = document.querySelectorAll('#contactCheckboxes input[type="checkbox"]:checked');
+            if (checkboxes) {
+                contacts = Array.from(checkboxes).map(cb => cb.value);
+            }
 
             if (!name) return alert("员工姓名不能为空！");
             renderEmployeeUI(currentTargetDesk, name, role);
-            ensureOneEmptyDesk(); // 填坑完毕后，自动在末尾再加一个空桌子
+            ensureOneEmptyDesk(); 
 
             try {
                 let res = await fetch('/api/config');
@@ -3166,7 +3208,16 @@ async function openLicenseModal() {
                 if (isEditing && originalEditName !== name && cfg.PeerNodes[originalEditName]) {
                     delete cfg.PeerNodes[originalEditName];
                 }
-                cfg.PeerNodes[name] = { Url: url, Role: role, Description: desc,Resume: resume, ModelIndex: modelIdx }; 
+                
+                // 👇 保存入库，把 Contacts 字段一起塞进去
+                cfg.PeerNodes[name] = { 
+                    Url: url, 
+                    Role: role, 
+                    Description: desc, 
+                    Resume: resume, 
+                    ModelIndex: modelIdx, 
+                    Contacts: contacts 
+                }; 
                 window.teamConfig = cfg; 
 
                 await fetch('/api/config', {
